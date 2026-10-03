@@ -1537,42 +1537,57 @@ function isNumericCell(ref: string): boolean { const v = engine.computeRef(activ
 // ===========================================================================
 // Insert / delete rows & columns (adjusts formula references)
 // ===========================================================================
-function shiftRefsInFormula(formula: string, fn: (ref: string) => string | null): string {
+function shiftRefsInFormula(formula: string, fn: (ref: string, other: string) => string | null): string {
   try {
     const ast = parseFormula(formula.slice(1));
     walkRefs(ast, fn);
     return "=" + serializeAst(ast);
   } catch (e) { return formula; }
 }
-function walkRefs(node: Ast | undefined, fn: (ref: string) => string | null): void {
+// Calls `fn` with each reference and the other end of the range it bounds (itself when it stands
+// alone), and puts back whatever it returns that isn't null.
+function walkRefs(node: Ast | undefined, fn: (ref: string, other: string) => string | null): void {
   if (!node || typeof node !== "object") return;
-  if (node.k === "ref") { const nr = fn(node.ref); if (nr != null) node.ref = nr; }
-  else if (node.k === "range") { const a = fn(node.a); const b = fn(node.b); if (a != null) node.a = a; if (b != null) node.b = b; }
+  if (node.k === "ref") { const nr = fn(node.ref, node.ref); if (nr != null) node.ref = nr; }
+  else if (node.k === "range") { const a = fn(node.a, node.b); const b = fn(node.b, node.a); if (a != null) node.a = a; if (b != null) node.b = b; }
   else {
     // Every other kind holds its operands under `a`/`b` and its arguments under `args`.
     const branches: { k: string; a?: Ast; b?: Ast; args?: Ast[] } = node;
     for (const key of ["a", "b"] as const) if (branches[key]) walkRefs(branches[key], fn); if (branches.args) branches.args.forEach((n) => walkRefs(n, fn));
   }
 }
-function adjustRef(ref: string, rowAt: number, rowDelta: number, colAt: number, colDelta: number): string | null {
-  const bang = ref.indexOf("!");
-  const sheetPrefix = bang >= 0 ? ref.slice(0, bang + 1) : "";
-  const body = bang >= 0 ? ref.slice(bang + 1) : ref;
-  if (bang >= 0) return null; // only adjust current-sheet refs for simplicity
-  const rc = parseRef(body);
-  if (!rc) return null;
-  let { r, c } = rc;
-  if (rowDelta) { if (r >= rowAt) r += rowDelta; }
-  if (colDelta) { if (c >= colAt) c += colDelta; }
-  if (r < 0 || c < 0) return "#REF!";
-  return sheetPrefix + rcToRef(r, c);
+// `ref` once `rowDelta` rows are inserted at `rowAt`, or for a negative delta once the rows from
+// `rowAt + rowDelta` up to `rowAt` are deleted; likewise for columns. As in Excel, a range keeps
+// whatever part of it survives, and a reference left with nothing becomes #REF! rather than naming
+// whichever cell slid into its place. `$` markers are kept: they pin a reference against copying,
+// not against the cell it names moving.
+function adjustRef(ref: string, other: string, rowAt: number, rowDelta: number, colAt: number, colDelta: number): string | null {
+  // Only current-sheet refs move. The far end of `Sheet2!A1:A5` names no sheet but belongs to one.
+  if (ref.includes("!") || other.includes("!")) return null;
+  const marks = /^(\$?)[A-Za-z]+(\$?)\d+$/.exec(ref);
+  const rc = parseRef(ref), far = parseRef(other);
+  if (!marks || !rc || !far) return null;
+  const r = shiftEdge(rc.r, far.r, rowAt, rowDelta), c = shiftEdge(rc.c, far.c, colAt, colDelta);
+  if (r == null || c == null) return "#REF!";
+  return marks[1] + colToLetter(c) + marks[2] + (r + 1);
+}
+// Where `i`, one edge of the span between it and `j`, lands after the shift adjustRef describes,
+// or null when the shift deletes the whole span. An edge on a deleted line moves inward to the
+// nearest line that survives.
+function shiftEdge(i: number, j: number, at: number, delta: number): number | null {
+  const from = Math.min(at, at + delta); // the first deleted line, or the insertion point
+  const lo = Math.min(i, j), hi = Math.max(i, j);
+  const newLo = lo >= at ? lo + delta : Math.min(lo, from);
+  const newHi = hi >= at ? hi + delta : Math.min(hi, from - 1);
+  if (newLo > newHi) return null;
+  return i === lo ? newLo : newHi;
 }
 
 function rewriteAllFormulas(rowAt: number, rowDelta: number, colAt: number, colDelta: number): void {
   const cells = curCells();
   for (const [ref, cell] of Object.entries(cells)) {
     if (cell.value && cell.value[0] === "=") {
-      const nf = shiftRefsInFormula(cell.value, (r) => adjustRef(r, rowAt, rowDelta, colAt, colDelta));
+      const nf = shiftRefsInFormula(cell.value, (r, other) => adjustRef(r, other, rowAt, rowDelta, colAt, colDelta));
       if (nf !== cell.value) cell.value = nf;
     }
   }
